@@ -242,7 +242,8 @@ def get_rj_vj_R(hessians, orbit_sat, mass_sat):
     return rj, vj, R
 
 @jax.jit
-def create_ic_particle_spray(orbit_sat, rj, vj, R, tail=0, key=random.PRNGKey(111)):
+def create_ic_particle_spray(orbit_sat, rj, vj, R, tail=0, seed=111):
+    key=random.PRNGKey(seed)
     N = rj.shape[0]
 
     tile = jax.lax.cond(tail == 0, lambda _: jnp.tile(jnp.array([1, -1]), N_PARTICLES//2),
@@ -438,10 +439,11 @@ def bin_stream(theta_stream, r_stream, x_stream, y_stream, vz_stream, min_count)
     # Step 2: Per-bin median computation
     def per_bin_median(bin_idx, bin_ids, r, x, y, vz):
         mask = bin_ids == bin_idx
-        count = jnp.sum(mask)
+        count = jnp.sum(mask).astype(jnp.float64)
 
         def compute_medians():
             return (
+                count,
                 jnp.nanmean(jnp.where(mask, r, jnp.nan)),
                 jnp.nanstd(jnp.where(mask, r, jnp.nan)),
                 jnp.nanmedian(jnp.where(mask, x, jnp.nan)),
@@ -449,19 +451,19 @@ def bin_stream(theta_stream, r_stream, x_stream, y_stream, vz_stream, min_count)
                 jnp.nanmedian(jnp.where(mask, vz, jnp.nan))
             )
 
-        return jax.lax.cond(count > min_count, compute_medians, lambda: (jnp.nan, jnp.nan, jnp.nan, jnp.nan, jnp.nan))
+        return jax.lax.cond(count > min_count, compute_medians, lambda: (jnp.nan, jnp.nan, jnp.nan, jnp.nan, jnp.nan, jnp.nan))
 
     # Step 3: Vectorize
     all_bins = jnp.arange(1, N_BINS + 1)
-    r_meds, w_meds, x_meds, y_meds, vz_meds = jax.vmap(per_bin_median, in_axes=(0, None, None, None, None, None))(
+    count, r_meds, w_meds, x_meds, y_meds, vz_meds = jax.vmap(per_bin_median, in_axes=(0, None, None, None, None, None))(
         all_bins, bin_indices, r_stream, x_stream, y_stream, vz_stream
     )
 
-    return r_meds, w_meds, x_meds, y_meds, vz_meds
+    return count, r_meds, w_meds, x_meds, y_meds, vz_meds
 
 @jax.jit
 def jax_stream_model(logM, Rs, q, dirx, diry, dirz, logm, rs,
-                        x0, y0, z0, vx0, vy0, vz0, time, alpha, tail, min_count):
+                        x0, y0, z0, vx0, vy0, vz0, time, alpha, tail, min_count, seed=111):
     # Condition: check that all differences in theta_sat are positive.
     # This ensures that the satellite is moving in a consistent direction.
     xv_sat, _ = backward_integrate_orbit_leapfrog(x0, y0, z0, vx0, vy0, vz0,
@@ -478,33 +480,36 @@ def jax_stream_model(logM, Rs, q, dirx, diry, dirz, logm, rs,
         xv_sat, _ = backward_integrate_orbit_leapfrog(x0, y0, z0, vx0, vy0, vz0,
                                                     logM, Rs, q, dirx, diry, dirz,
                                                     time)
-        theta_sat = jnp.arctan2(xv_sat[:, 1], xv_sat[:, 0])
-        theta_sat = jnp.where(theta_sat < 0, theta_sat + 2 * jnp.pi, theta_sat)
-        theta_sat = jax_unwrap(theta_sat)
+        # theta_sat = jnp.arctan2(xv_sat[:, 1], xv_sat[:, 0])
+        # theta_sat = jnp.where(theta_sat < 0, theta_sat + 2 * jnp.pi, theta_sat)
+        # theta_sat = jax_unwrap(theta_sat)
 
         xv_sat_forward, _ = forward_integrate_orbit_leapfrog(xv_sat[0, 0], xv_sat[0, 1], xv_sat[0, 2], xv_sat[0,3], xv_sat[0, 4], xv_sat[0, 5],
                                                     logM, Rs, q, dirx, diry, dirz,
-                                                    time*alpha)
+                                                    time*alpha)        
+        theta_sat_forward = jnp.arctan2(xv_sat_forward[:, 1], xv_sat_forward[:, 0])
+        theta_sat_forward = jnp.where(theta_sat_forward < 0, theta_sat_forward + 2 * jnp.pi, theta_sat_forward)
+        theta_sat_forward = jax_unwrap(theta_sat_forward)
 
         hessians = vector_NFW_Hessian(xv_sat_forward[:, 0], xv_sat_forward[:, 1], xv_sat_forward[:, 2],
                                         logM, Rs, q, dirx, diry, dirz)
         rj, vj, R = get_rj_vj_R(hessians, xv_sat_forward, 10 ** logm)
-        ic_particle_spray = create_ic_particle_spray(xv_sat_forward, rj, vj, R, tail)
+        ic_particle_spray = create_ic_particle_spray(xv_sat_forward, rj, vj, R, tail, seed=seed)
 
         xv_stream = generate_stream(ic_particle_spray, xv_sat_forward, logM, Rs, q,
                                     dirx, diry, dirz, logm, rs, time)
         
         # === Process angles as a function of Progenitor ===
         # Count how many complete 2pi rotations have been accumulated (integer division).
-        theta_count = jnp.floor_divide(theta_sat, 2 * jnp.pi)
+        theta_count = jnp.floor_divide(theta_sat_forward, 2 * jnp.pi)
 
         final_theta_stream = (
             xv_stream[:, 0] #jnp.sum(theta_stream * diagonal_matrix, axis=1)
-            - theta_sat[-1]
+            - theta_sat_forward[-1]
             + jnp.repeat(theta_count,  N_PARTICLES// N_STEPS) * 2 * jnp.pi
             )
 
-        algin_reference = theta_sat[-1]- theta_count[-1]*(2*jnp.pi) # Make sure the angle of reference is at theta=0
+        algin_reference = theta_sat_forward[-1]- theta_count[-1]*(2*jnp.pi) # Make sure the angle of reference is at theta=0
 
         final_theta_stream += (1 - jnp.sign(algin_reference - jnp.pi))/2 * algin_reference + \
                                 (1 + jnp.sign(algin_reference - jnp.pi))/2 * (algin_reference - 2 * jnp.pi)
@@ -519,12 +524,12 @@ def jax_stream_model(logM, Rs, q, dirx, diry, dirz, logm, rs,
         vz_stream    = xv_stream[:-(N_PARTICLES//100), -1]
 
         r_stream = jnp.sqrt(x_stream**2 + y_stream**2)
-        r_meds, w_meds, x_meds, y_meds, vz_meds = \
+        count, r_meds, w_meds, x_meds, y_meds, vz_meds = \
             bin_stream(theta_stream, r_stream, x_stream, y_stream, vz_stream,
                         min_count=min_count)
 
         return theta_stream, x_stream, y_stream, vz_stream, \
-                r_meds, w_meds, x_meds, y_meds, vz_meds
+                count, r_meds, w_meds, x_meds, y_meds, vz_meds
 
     # Define the branch to use if condition is false.
     # Here we return dummy arrays with the same shapes and dtypes as in the true branch.
@@ -549,13 +554,14 @@ def jax_stream_model(logM, Rs, q, dirx, diry, dirz, logm, rs,
             dummy_x     = jnp.full((99*N_PARTICLES//100,), jnp.nan, dtype=jnp.float64)
             dummy_y     = jnp.full((99*N_PARTICLES//100,), jnp.nan, dtype=jnp.float64)
             dummy_vz    = jnp.full((99*N_PARTICLES//100,), jnp.nan, dtype=jnp.float64)
+            dummy_count = jnp.full((N_BINS,), jnp.nan, dtype=jnp.float64)
             dummy_r_meds = jnp.full((N_BINS,), jnp.nan, dtype=jnp.float64)
             dummy_w_meds = jnp.full((N_BINS,), jnp.nan, dtype=jnp.float64)
             dummy_x_meds = jnp.full((N_BINS,), jnp.nan, dtype=jnp.float64)
             dummy_y_meds = jnp.full((N_BINS,), jnp.nan, dtype=jnp.float64)
             dummy_vz_meds = jnp.full((N_BINS,), jnp.nan, dtype=jnp.float64)
 
-            return dummy_theta, dummy_x, dummy_y, dummy_vz, dummy_r_meds, dummy_w_meds, dummy_x_meds, dummy_y_meds, dummy_vz_meds
+            return dummy_theta, dummy_x, dummy_y, dummy_vz, dummy_count, dummy_r_meds, dummy_w_meds, dummy_x_meds, dummy_y_meds, dummy_vz_meds
 
     # Use lax.cond to select the branch.
     return jax.lax.cond(cond, true_branch, false_branch, operand=None)
